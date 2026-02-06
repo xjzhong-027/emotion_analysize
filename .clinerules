@@ -43,7 +43,83 @@
 - `eval_checkpoint.py` - 模型评估
 - `visualize_*.py` - 各类可视化工具
 
+## 服务器实验流程
+
+### 服务器信息
+- 服务器地址：`ssh root@8.138.115.47`
+- 工作目录：`/root/ICT-main/`
+- GPU 环境：CUDA 可用
+
+### 上传代码到服务器
+```bash
+# 方法1：使用 scp 上传单个文件
+scp <本地文件路径> root@8.138.115.47:/root/ICT-main/
+
+# 方法2：使用 scp 上传整个目录
+scp -r <本地目录> root@8.138.115.47:/root/ICT-main/
+
+# 方法3：使用 Git（推荐）
+# 在服务器上：
+cd /root/ICT-main
+git pull origin master
+```
+
+### 训练命令
+```bash
+# SSH 登录服务器
+ssh root@8.138.115.47
+
+# 进入项目目录
+cd /root/ICT-main
+
+# 使用 nohup 后台训练（推荐）
+nohup python main.py > training.log 2>&1 &
+
+# 或使用 screen/tmux 会话训练
+screen -S ict_training
+python main.py
+# Ctrl+A+D 分离会话
+
+# 查看训练日志
+tail -f training.log
+
+# 查看 GPU 使用情况
+nvidia-smi
+
+# 查看后台进程
+ps aux | grep python
+```
+
+### 下载结果
+```bash
+# 下载训练好的模型
+scp root@8.138.115.47:/root/ICT-main/checkpoint/*.pth ./checkpoint/
+
+# 下载可视化结果
+scp -r root@8.138.115.47:/root/ICT-main/*_vis/ ./
+
+# 下载日志文件
+scp root@8.138.115.47:/root/ICT-main/training.log ./
+```
+
+### 常见操作
+```bash
+# 停止训练进程
+pkill -f "python main.py"
+
+# 清理旧的 checkpoint
+rm -rf checkpoint/old_*.pth
+
+# 检查磁盘空间
+df -h
+
+# 查看目录大小
+du -sh /root/ICT-main/*
+```
+
 ## 注意事项
 - 模型文件很大（2.7GB），已在 .gitignore 中排除
 - 使用 GPU 训练，注意显存管理
 - 实验结果需要可视化分析以便论文撰写
+- 服务器训练时使用 nohup 或 screen 避免断线中断
+- 定期下载 checkpoint 到本地备份
