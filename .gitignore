@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# 模型文件和权重（太大，不适合 Git）
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.pkl
+
+# 数据集（通常很大）
+datasets/
+data/
+
+# 实验输出
+checkpoints/
+results/
+*.log
+*.txt
+
+# 可视化输出
+*_vis/
+*_vis_*/
+cfm_vis/
+cfm_vis_*/
+ddm_vis/
+ddm_vis_*/
+sent_mod_vis_*/
+
+# NumPy 数组文件
+*.npy
+*.npz
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.bak
