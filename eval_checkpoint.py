@@ -92,7 +92,7 @@ def main():
     parser.add_argument("--use_ddm", action="store_true")
     parser.add_argument("--use_sentiment_stream", action="store_true", help="情感双流替代 DDM，与 --use_ddm 互斥")
     parser.add_argument("--ddm_mode", type=str, default="text_shared", choices=["text_shared", "image_shared", "all"])
-    parser.add_argument("--no_image_token_align", action="store_true")
+    parser.add_argument("--use_image_token_align", action="store_true")
     parser.add_argument("--lambda1", type=float, default=1.5)
     parser.add_argument("--lambda2", type=float, default=0.5)
     parser.add_argument("--use_cfm", action="store_true")
@@ -210,7 +210,7 @@ def main():
         beta=args.beta,
         use_ddm=args.use_ddm,
         ddm_mode=args.ddm_mode,
-        use_image_token_align=not args.no_image_token_align,
+        use_image_token_align=args.use_image_token_align,
         ddm_debug=False,
         lambda1=args.lambda1,
         lambda2=args.lambda2,

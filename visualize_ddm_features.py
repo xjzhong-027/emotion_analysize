@@ -40,7 +40,9 @@ DDM 特征可视化脚本
 import os
 import numpy as np
 from sklearn.manifold import TSNE
+from sklearn.metrics import silhouette_score, davies_bouldin_score
 import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
 
 
 def _ensure_dir(path: str) -> None:
@@ -368,10 +370,241 @@ def visualize_ddm_features(
                 sentiment_only=True,
                 sentiment_bigger=False
             )
+
+            # 8. 并排对比：image_specific (pooled) vs image_specific_aligned（仅情感类别）
+            if is_ is not None:
+                print("[DDM VIS] 生成 image_specific vs image_specific_aligned 并排对比图...")
+                plot_side_by_side_comparison(
+                    is_valid, is_aligned_valid, labels_flat_for_image, labels_flat,
+                    output_dir, max_samples=2000
+                )
+
+            # 9. 计算聚类度量（仅情感类别）
+            if is_ is not None:
+                print("[DDM VIS] 计算情感聚类度量...")
+                compute_clustering_metrics(
+                    is_valid, is_aligned_valid, labels_flat_for_image, labels_flat,
+                    output_dir
+                )
     else:
         print("[DDM VIS] 警告：未找到标签数据，跳过按label着色的可视化")
 
     print("[DDM VIS] 特征可视化完成。")
+
+
+def plot_side_by_side_comparison(is_pooled, is_aligned, labels_pooled, labels_aligned, output_dir, max_samples=2000):
+    """
+    并排对比 image_specific (pooled) vs image_specific_aligned 的情感聚类效果。
+
+    Args:
+        is_pooled: 池化后的 image_specific [N1, C]
+        is_aligned: token 对齐后的 image_specific_aligned [N2, C]
+        labels_pooled: is_pooled 对应的标签 [N1]
+        labels_aligned: is_aligned 对应的标签 [N2]
+        output_dir: 输出目录
+        max_samples: 最大样本数
+    """
+    SENTIMENT_LABELS = (2, 3, 4)
+    label_names = {2: "B-NEG", 3: "B-NEU", 4: "B-POS"}
+    colors = {2: 'red', 3: 'orange', 4: 'green'}
+
+    # 只保留情感类别
+    mask_pooled = np.isin(labels_pooled, list(SENTIMENT_LABELS))
+    mask_aligned = np.isin(labels_aligned, list(SENTIMENT_LABELS))
+
+    if mask_pooled.sum() == 0 or mask_aligned.sum() == 0:
+        print("[DDM VIS] 跳过并排对比：无足够情感样本")
+        return
+
+    X_pooled = is_pooled[mask_pooled]
+    y_pooled = labels_pooled[mask_pooled]
+    X_aligned = is_aligned[mask_aligned]
+    y_aligned = labels_aligned[mask_aligned]
+
+    # 限制样本数
+    n_pooled = min(len(X_pooled), max_samples)
+    n_aligned = min(len(X_aligned), max_samples)
+    X_pooled, y_pooled = X_pooled[:n_pooled], y_pooled[:n_pooled]
+    X_aligned, y_aligned = X_aligned[:n_aligned], y_aligned[:n_aligned]
+
+    # t-SNE 降维
+    print(f"[DDM VIS] 对 {n_pooled} 个 pooled 样本和 {n_aligned} 个 aligned 样本进行 t-SNE...")
+    tsne = TSNE(n_components=2, random_state=42, init="random", learning_rate="auto")
+    X_pooled_2d = tsne.fit_transform(X_pooled)
+    X_aligned_2d = tsne.fit_transform(X_aligned)
+
+    # 创建并排子图
+    fig = plt.figure(figsize=(16, 7))
+    gs = GridSpec(1, 2, figure=fig, wspace=0.3)
+
+    # 左图：image_specific (pooled)
+    ax1 = fig.add_subplot(gs[0, 0])
+    for label_id in [2, 3, 4]:
+        if label_id not in y_pooled:
+            continue
+        mask = (y_pooled == label_id)
+        ax1.scatter(
+            X_pooled_2d[mask, 0], X_pooled_2d[mask, 1],
+            s=20, alpha=0.7, c=colors[label_id], label=label_names[label_id],
+            edgecolors='white', linewidths=0.3
+        )
+    ax1.set_title("image_specific (Pooled)", fontsize=14, fontweight='bold')
+    ax1.set_xlabel("t-SNE Dimension 1", fontsize=11)
+    ax1.set_ylabel("t-SNE Dimension 2", fontsize=11)
+    ax1.legend(loc='best', fontsize=10)
+    ax1.grid(alpha=0.3)
+
+    # 右图：image_specific_aligned (Token-aligned)
+    ax2 = fig.add_subplot(gs[0, 1])
+    for label_id in [2, 3, 4]:
+        if label_id not in y_aligned:
+            continue
+        mask = (y_aligned == label_id)
+        ax2.scatter(
+            X_aligned_2d[mask, 0], X_aligned_2d[mask, 1],
+            s=20, alpha=0.7, c=colors[label_id], label=label_names[label_id],
+            edgecolors='white', linewidths=0.3
+        )
+    ax2.set_title("image_specific_aligned (Token-aligned)", fontsize=14, fontweight='bold')
+    ax2.set_xlabel("t-SNE Dimension 1", fontsize=11)
+    ax2.set_ylabel("t-SNE Dimension 2", fontsize=11)
+    ax2.legend(loc='best', fontsize=10)
+    ax2.grid(alpha=0.3)
+
+    plt.suptitle("Comparison: Pooled vs Token-aligned Image Features (Sentiment Only)",
+                 fontsize=16, fontweight='bold', y=0.98)
+
+    out_path = os.path.join(output_dir, "ddm_tsne_image_comparison_side_by_side.png")
+    plt.savefig(out_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"[DDM VIS] 保存并排对比图到: {out_path}")
+
+
+def compute_clustering_metrics(is_pooled, is_aligned, labels_pooled, labels_aligned, output_dir):
+    """
+    计算并保存情感聚类度量指标（Silhouette Score 和 Davies-Bouldin Index）。
+
+    Args:
+        is_pooled: 池化后的 image_specific [N1, C]
+        is_aligned: token 对齐后的 image_specific_aligned [N2, C]
+        labels_pooled: is_pooled 对应的标签 [N1]
+        labels_aligned: is_aligned 对应的标签 [N2]
+        output_dir: 输出目录
+    """
+    SENTIMENT_LABELS = (2, 3, 4)
+
+    # 只保留情感类别
+    mask_pooled = np.isin(labels_pooled, list(SENTIMENT_LABELS))
+    mask_aligned = np.isin(labels_aligned, list(SENTIMENT_LABELS))
+
+    if mask_pooled.sum() < 10 or mask_aligned.sum() < 10:
+        print("[DDM VIS] 跳过聚类度量：样本数不足")
+        return
+
+    X_pooled = is_pooled[mask_pooled]
+    y_pooled = labels_pooled[mask_pooled]
+    X_aligned = is_aligned[mask_aligned]
+    y_aligned = labels_aligned[mask_aligned]
+
+    # 限制样本数（避免计算过慢）
+    max_samples = 2000
+    if len(X_pooled) > max_samples:
+        indices = np.random.choice(len(X_pooled), max_samples, replace=False)
+        X_pooled, y_pooled = X_pooled[indices], y_pooled[indices]
+    if len(X_aligned) > max_samples:
+        indices = np.random.choice(len(X_aligned), max_samples, replace=False)
+        X_aligned, y_aligned = X_aligned[indices], y_aligned[indices]
+
+    # 计算指标
+    try:
+        sil_pooled = silhouette_score(X_pooled, y_pooled)
+        db_pooled = davies_bouldin_score(X_pooled, y_pooled)
+    except Exception as e:
+        print(f"[DDM VIS] 计算 pooled 指标失败: {e}")
+        sil_pooled, db_pooled = None, None
+
+    try:
+        sil_aligned = silhouette_score(X_aligned, y_aligned)
+        db_aligned = davies_bouldin_score(X_aligned, y_aligned)
+    except Exception as e:
+        print(f"[DDM VIS] 计算 aligned 指标失败: {e}")
+        sil_aligned, db_aligned = None, None
+
+    # 保存结果
+    out_path = os.path.join(output_dir, "clustering_metrics.txt")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("=" * 60 + "\n")
+        f.write("情感聚类度量对比（仅 B-NEG/B-NEU/B-POS）\n")
+        f.write("=" * 60 + "\n\n")
+
+        f.write("指标说明：\n")
+        f.write("- Silhouette Score（轮廓系数）：范围 [-1, 1]，越接近 1 表示聚类越好\n")
+        f.write("- Davies-Bouldin Index（DB指数）：越小越好，表示类内紧密、类间分离\n\n")
+
+        f.write("-" * 60 + "\n")
+        f.write("image_specific (Pooled):\n")
+        f.write("-" * 60 + "\n")
+        if sil_pooled is not None:
+            f.write(f"  Silhouette Score: {sil_pooled:.4f}\n")
+            f.write(f"  Davies-Bouldin Index: {db_pooled:.4f}\n")
+        else:
+            f.write("  计算失败\n")
+
+        f.write("\n")
+        f.write("-" * 60 + "\n")
+        f.write("image_specific_aligned (Token-aligned):\n")
+        f.write("-" * 60 + "\n")
+        if sil_aligned is not None:
+            f.write(f"  Silhouette Score: {sil_aligned:.4f}\n")
+            f.write(f"  Davies-Bouldin Index: {db_aligned:.4f}\n")
+        else:
+            f.write("  计算失败\n")
+
+        f.write("\n")
+        f.write("-" * 60 + "\n")
+        f.write("对比分析：\n")
+        f.write("-" * 60 + "\n")
+        if sil_pooled is not None and sil_aligned is not None:
+            sil_diff = sil_aligned - sil_pooled
+            db_diff = db_pooled - db_aligned  # 注意：DB 越小越好，所以用 pooled - aligned
+
+            f.write(f"  Silhouette Score 变化: {sil_diff:+.4f} ")
+            if sil_diff > 0.01:
+                f.write("(✓ Token对齐改善了聚类)\n")
+            elif sil_diff < -0.01:
+                f.write("(✗ Token对齐降低了聚类质量)\n")
+            else:
+                f.write("(≈ 变化不明显)\n")
+
+            f.write(f"  Davies-Bouldin Index 变化: {-db_diff:+.4f} ")
+            if db_diff > 0.1:
+                f.write("(✓ Token对齐改善了聚类)\n")
+            elif db_diff < -0.1:
+                f.write("(✗ Token对齐降低了聚类质量)\n")
+            else:
+                f.write("(≈ 变化不明显)\n")
+
+            f.write("\n结论：\n")
+            if sil_diff > 0.01 and db_diff > 0.1:
+                f.write("  ✓✓ Token对齐显著改善了情感聚类效果\n")
+            elif sil_diff > 0.01 or db_diff > 0.1:
+                f.write("  ✓ Token对齐在某些指标上改善了聚类\n")
+            elif sil_diff < -0.01 and db_diff < -0.1:
+                f.write("  ✗✗ Token对齐显著降低了聚类质量（可能过拟合或引入噪声）\n")
+            elif sil_diff < -0.01 or db_diff < -0.1:
+                f.write("  ✗ Token对齐在某些指标上降低了聚类质量\n")
+            else:
+                f.write("  ≈ Token对齐对聚类效果影响不明显\n")
+
+        f.write("\n")
+        f.write("=" * 60 + "\n")
+
+    print(f"[DDM VIS] 保存聚类度量到: {out_path}")
+
+    # 同时打印到控制台
+    if sil_pooled is not None and sil_aligned is not None:
+        print(f"[DDM VIS] Silhouette Score: Pooled={sil_pooled:.4f}, Aligned={sil_aligned:.4f}, Δ={sil_aligned-sil_pooled:+.4f}")
+        print(f"[DDM VIS] Davies-Bouldin Index: Pooled={db_pooled:.4f}, Aligned={db_aligned:.4f}, Δ={db_aligned-db_pooled:+.4f}")
 
 
 if __name__ == "__main__":

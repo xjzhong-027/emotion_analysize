@@ -46,9 +46,9 @@ parser.add_argument(
     help='Enable DDM debug mode (log feature stats and export sample features)',
 )
 parser.add_argument(
-    '--no_image_token_align',
+    '--use_image_token_align',
     action='store_true',
-    help='Disable image_specific token-level alignment in DDM for ablation (default: alignment on)',
+    help='Enable image_specific token-level alignment in DDM (default: disabled)',
 )
 parser.add_argument(
     '--lambda1',
@@ -260,7 +260,7 @@ vb_model = ICTModel(
     beta=beta,
     use_ddm=args.use_ddm,
     ddm_mode=args.ddm_mode,
-    use_image_token_align=not args.no_image_token_align,
+    use_image_token_align=args.use_image_token_align,
     ddm_debug=args.ddm_debug,
     lambda1=args.lambda1,
     lambda2=args.lambda2,
