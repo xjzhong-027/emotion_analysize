@@ -13,10 +13,59 @@
 4. **Sentiment Stream** - 情感流模块
 
 ## 项目阶段
-当前阶段：模型训练与调试
-- 已完成基础模型实现
-- 正在进行模型训练和性能优化
+当前阶段：阶段 1 - 双模态 Twitter ABSA 的完全复现与吃透
+- 已完成 Twitter-2015 和 Twitter-2017 的 baseline 复现
+- 正在进行模型优化和消融实验
 - 需要可视化和分析工具辅助调试
+
+## 实验结果记录
+
+### Baseline 结果（已完成）
+
+#### Twitter-2015 最佳配置
+```bash
+Task: dualc (双模态方面级情感分类)
+Text Model: roberta-large
+Image Model: vit-large-patch16-224
+Batch Size: 16
+Learning Rate: 2.26e-05
+Alpha: 0.635  # 文本模态权重
+Beta: 0.565   # 图像模态权重
+Epochs: 80
+
+# 结果
+Best F1 (multi): 69.48%
+Best F1 (text): 69.17%
+Precision (multi): 68.41%
+Recall (multi): 70.59%
+```
+
+#### Twitter-2017 最佳配置
+```bash
+Task: dualc
+Text Model: roberta-large
+Image Model: vit-large-patch16-224
+Batch Size: 16
+Learning Rate: 2.26e-05
+Alpha: 0.635
+Beta: 0.565
+Epochs: 80
+
+# 结果
+Best F1 (multi): 70.35%
+Best F1 (text): 70.50%
+Precision (multi): 69.57%
+Recall (multi): 71.15%
+
+# 对比：2017 比 2015 高 0.87 个百分点
+```
+
+### 参数说明
+- **Alpha**: 文本模态的融合权重，控制文本特征在跨模态融合中的贡献
+- **Beta**: 图像模态的融合权重，控制图像特征在跨模态融合中的贡献
+- **Learning Rate**: 建议范围 1e-5 ~ 5e-5，过大容易不收敛
+- **Batch Size**: 受 GPU 显存限制，16 是较优选择
+- **Epochs**: 80 轮足够收敛，可根据验证集表现提前停止
 
 ## 开发原则
 
