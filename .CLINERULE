@@ -1,0 +1,299 @@
+# CLI Rules for ICT-main Project
+
+## 1. 文件上传规则
+
+### SCP 上传命令模板
+```bash
+scp -o "proxycommand connect -H gpu.gdufsdm.cn:27001 %h %p" <local_file> root@qudr1g5l7lgbe7c3ahwi5whkdhtmio2u.ssh:~/data/ICT-main-mdre/ICT-main/
+```
+
+### 常用上传命令示例
+```bash
+# 上传 model.py
+scp -o "proxycommand connect -H gpu.gdufsdm.cn:27001 %h %p" model.py root@qudr1g5l7lgbe7c3ahwi5whkdhtmio2u.ssh:~/data/ICT-main-mdre/ICT-main/
+
+# 上传 main.py
+scp -o "proxycommand connect -H gpu.gdufsdm.cn:27001 %h %p" main.py root@qudr1g5l7lgbe7c3ahwi5whkdhtmio2u.ssh:~/data/ICT-main-mdre/ICT-main/
+
+# 上传诊断脚本
+scp -o "proxycommand connect -H gpu.gdufsdm.cn:27001 %h %p" diagnose_entropy_baseline.py root@qudr1g5l7lgbe7c3ahwi5whkdhtmio2u.ssh:~/data/ICT-main-mdre/ICT-main/
+
+# 上传多个文件
+scp -o "proxycommand connect -H gpu.gdufsdm.cn:27001 %h %p" model.py main.py entropy_utils.py root@qudr1g5l7lgbe7c3ahwi5whkdhtmio2u.ssh:~/data/ICT-main-mdre/ICT-main/
+```
+
+---
+
+## 2. 标准训练参数配置
+
+### 基础参数（必须显式指定）
+```bash
+--dataset_type 2017
+--text_model_name roberta-large
+--image_model_name vit-large
+--batch_size 16
+--alpha 0.635
+--beta 0.365
+--lr 2.26e-05
+--epochs 60
+--random_seed 2022
+```
+
+### DDM 相关参数
+```bash
+--use_ddm                    # 启用 DDM
+--use_asymmetric_dims        # 启用非对称维度
+--ddm_mode all               # DDM 模式：all
+--use_image_token_align      # 启用图像token对齐
+--lambda1 0.0                # 正交损失权重（设为0表示不使用）
+```
+
+### CFM 相关参数
+```bash
+--use_cfm                    # 启用 CFM
+--lambda3 0.3                # CFM 分支一致性损失权重
+--lambda4 0.01               # CFM 融合权重正则化
+```
+
+### CRM 相关参数
+```bash
+--use_crm                    # 启用 CRM
+--lambda_crm 0.1             # CRM 辅助损失权重
+--crm_num_prototypes 10      # 每个情感类别的原型数量
+```
+
+### 多读取融合参数
+```bash
+--use_multi_read_fused       # 启用多读取融合
+```
+
+### 明确禁用的功能（防止默认值启动）
+```bash
+--ddm_debug                  # 不添加此参数（默认False）
+--lambda_sent_cls 0.0        # 情感分类损失权重设为0
+--lambda_sent_aux 0.0        # 情感中心损失权重设为0
+--use_sent_mod               # 不添加此参数（默认False）
+--lambda_sent_mod 0.1        # 保持默认值
+--use_sent_mod_fuse          # 不添加此参数（默认False）
+--use_sent_mod_fuse_b        # 不添加此参数（默认False）
+--sent_mod_num_prototypes 5  # 保持默认值
+--sent_mod_fuse_text_weight 0.5  # 保持默认值
+--use_sentiment_stream       # 不添加此参数（默认False）
+--use_contrastive_loss       # 不添加此参数（默认False）
+--contrastive_temperature 0.07  # 保持默认值
+--use_curriculum             # 不添加此参数（默认False）
+--curriculum_start_ratio 0.3 # 保持默认值
+--curriculum_end_ratio 1.0   # 保持默认值
+--curriculum_warmup_epochs 30  # 保持默认值
+--use_fgm                    # 不添加此参数（默认False）
+--fgm_epsilon 1.0            # 保持默认值
+```
+
+---
+
+## 3. 完整的标准训练命令
+
+### 基线模型（不含熵增损失）
+```bash
+python main.py \
+  --dataset_type 2017 \
+  --text_model_name roberta-large \
+  --image_model_name vit-large \
+  --batch_size 16 \
+  --alpha 0.635 \
+  --beta 0.365 \
+  --lr 2.26e-05 \
+  --epochs 60 \
+  --random_seed 2022 \
+  --use_ddm \
+  --use_asymmetric_dims \
+  --ddm_mode all \
+  --use_image_token_align \
+  --lambda1 0.0 \
+  --use_cfm \
+  --lambda3 0.3 \
+  --lambda4 0.01 \
+  --lambda_sent_cls 0.0 \
+  --lambda_sent_aux 0.0 \
+  --use_crm \
+  --lambda_crm 0.1 \
+  --crm_num_prototypes 10 \
+  --use_multi_read_fused
+```
+
+### 启用熵增损失的训练命令
+```bash
+python main.py \
+  --dataset_type 2017 \
+  --text_model_name roberta-large \
+  --image_model_name vit-large \
+  --batch_size 16 \
+  --alpha 0.635 \
+  --beta 0.365 \
+  --lr 2.26e-05 \
+  --epochs 60 \
+  --random_seed 2022 \
+  --use_ddm \
+  --use_asymmetric_dims \
+  --ddm_mode all \
+  --use_image_token_align \
+  --lambda1 0.0 \
+  --use_cfm \
+  --lambda3 0.3 \
+  --lambda4 0.01 \
+  --lambda_sent_cls 0.0 \
+  --lambda_sent_aux 0.0 \
+  --use_crm \
+  --lambda_crm 0.1 \
+  --crm_num_prototypes 10 \
+  --use_multi_read_fused \
+  --use_entropy_increase \
+  --entropy_increase_weight 0.1
+```
+
+### 后台运行命令
+```bash
+nohup python main.py \
+  --dataset_type 2017 \
+  --text_model_name roberta-large \
+  --image_model_name vit-large \
+  --batch_size 16 \
+  --alpha 0.635 \
+  --beta 0.365 \
+  --lr 2.26e-05 \
+  --epochs 60 \
+  --random_seed 2022 \
+  --use_ddm \
+  --use_asymmetric_dims \
+  --ddm_mode all \
+  --use_image_token_align \
+  --lambda1 0.0 \
+  --use_cfm \
+  --lambda3 0.3 \
+  --lambda4 0.01 \
+  --lambda_sent_cls 0.0 \
+  --lambda_sent_aux 0.0 \
+  --use_crm \
+  --lambda_crm 0.1 \
+  --crm_num_prototypes 10 \
+  --use_multi_read_fused \
+  --use_entropy_increase \
+  --entropy_increase_weight 0.1 \
+  > train_entropy.log 2>&1 &
+```
+
+---
+
+## 4. 熵增损失参数调优实验
+
+### 实验1：不同权重对比
+```bash
+# 基线（不使用熵增）
+--output_dir ./results/baseline
+
+# 权重 0.05
+--use_entropy_increase --entropy_increase_weight 0.05 --output_dir ./results/entropy_0.05
+
+# 权重 0.1（推荐起始值）
+--use_entropy_increase --entropy_increase_weight 0.1 --output_dir ./results/entropy_0.1
+
+# 权重 0.15
+--use_entropy_increase --entropy_increase_weight 0.15 --output_dir ./results/entropy_0.15
+
+# 权重 0.2
+--use_entropy_increase --entropy_increase_weight 0.2 --output_dir ./results/entropy_0.2
+```
+
+---
+
+## 5. 参数说明
+
+### 关键参数解释
+- `dataset_type`: 数据集类型（2015/2017）
+- `text_model_name`: 文本模型（roberta-large）
+- `image_model_name`: 图像模型（vit-large）
+- `alpha`: 文本模态权重（0.635）
+- `beta`: 图像模态权重（0.365）
+- `use_ddm`: 启用双层解耦模块
+- `use_asymmetric_dims`: 使用非对称维度分配
+- `ddm_mode`: DDM特征融合模式（all=使用所有特征）
+- `use_image_token_align`: 启用图像特定token级对齐
+- `use_cfm`: 启用分类融合机制
+- `use_crm`: 启用原型分类
+- `use_multi_read_fused`: 启用多读取融合
+- `use_entropy_increase`: 启用熵增损失
+- `entropy_increase_weight`: 熵增损失权重
+
+### 注意事项
+1. **所有布尔参数必须显式指定**：即使是False，也要确保不添加对应的flag
+2. **数值参数即使使用默认值也要显式指定**：防止代码更新后默认值变化
+3. **lambda 参数设为 0.0 表示禁用对应损失**：而不是不传递参数
+4. **互斥功能不能同时启用**：如 use_sentiment_stream 与 use_ddm
+
+---
+
+## 6. 常用操作命令
+
+### SSH 登录
+```bash
+ssh -o "proxycommand connect -H gpu.gdufsdm.cn:27001 %h %p" root@qudr1g5l7lgbe7c3ahwi5whkdhtmio2u.ssh
+```
+
+### 查看日志
+```bash
+# 实时查看
+tail -f train_entropy.log
+
+# 查看最后100行
+tail -n 100 train_entropy.log
+
+# 搜索熵增损失
+grep "entropy_increase" train_entropy.log
+```
+
+### 进程管理
+```bash
+# 查看Python进程
+ps aux | grep python
+
+# 查看GPU使用情况
+nvidia-smi
+
+# 终止进程
+kill -9 <PID>
+```
+
+---
+
+## 7. 文件清单
+
+需要上传到服务器的核心文件：
+- `model.py` - 模型定义（包含熵增损失逻辑）
+- `main.py` - 主训练脚本（包含参数解析）
+- `entropy_utils.py` - 熵增损失工具函数（如果有）
+- 其他修改过的模块文件
+
+---
+
+## 8. 版本控制
+
+### Git 提交规范
+```bash
+# 添加修改
+git add model.py main.py .CLINERULE
+
+# 提交
+git commit -m "feat: 添加熵增损失功能和CLI规则文档"
+
+# 推送到远程
+git push origin main
+```
+
+### 标签管理
+```bash
+# 创建版本标签
+git tag -a v1.0-entropy -m "添加熵增损失功能"
+
+# 推送标签
+git push origin v1.0-entropy
+```

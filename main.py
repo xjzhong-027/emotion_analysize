@@ -12,8 +12,9 @@ from typing import Callable, Dict
 from transformers import AutoModel, AutoConfig, AutoTokenizer
 from transformers import DebertaForTokenClassification
 from transformers import SwinForImageClassification
-from transformers import AutoConfig, TrainingArguments, Trainer, EvalPrediction, CLIPModel
+from transformers import AutoConfig, TrainingArguments, Trainer, EvalPrediction, CLIPModel, TrainerCallback, EarlyStoppingCallback
 from transformers import BertForTokenClassification, RobertaForTokenClassification, AlbertForTokenClassification, ViTForImageClassification, SwinForImageClassification, DeiTModel, ConvNextForImageClassification, ResNetModel, ElectraForTokenClassification
+from fgm import FGM  # 导入FGM对抗训练模块
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset_type', type=str, default='2015', nargs='?', help='display a string')
@@ -29,6 +30,7 @@ parser.add_argument('--text_model_name', type=str, default="roberta", nargs='?')
 parser.add_argument('--image_model_name', type=str, default="vit", nargs='?')
 parser.add_argument('--random_seed', type=int, default=2022, nargs='?')
 parser.add_argument('--use_ddm', action='store_true', help='Use Dual-level Disentanglement Module')
+parser.add_argument('--use_asymmetric_dims', action='store_true', help='Use asymmetric dimension allocation (text=512, image=256, shared=256) for DDM')
 parser.add_argument('--use_sentiment_stream', action='store_true', help='Use sentiment-relevant/irrelevant two streams (replaces DDM), per-token query image')
 parser.add_argument(
     '--ddm_mode',
@@ -56,20 +58,14 @@ parser.add_argument(
     default=1.5,
     help='Weight for orthogonal loss (default: 1.5)',
 )
-parser.add_argument(
-    '--lambda2',
-    type=float,
-    default=0.5,
-    help='Weight for enhanced triplet loss (default: 0.5)',
-)
 parser.add_argument('--use_cfm', action='store_true', help='Use CFM (Classification Fusion Mechanism) when use_ddm')
-parser.add_argument('--lambda3', type=float, default=0.3, help='Weight for CFM branch consistency loss')
-parser.add_argument('--lambda4', type=float, default=0.1, help='Weight for CFM fusion weight regularization')
+parser.add_argument('--lambda3', type=float, default=0.6, help='Weight for CFM branch consistency loss')
+parser.add_argument('--lambda4', type=float, default=0.0, help='Weight for CFM fusion weight regularization (set to 0 to disable)')
 parser.add_argument('--cfm_debug', action='store_true', help='Enable CFM debug mode (log weights and save samples)')
 parser.add_argument('--lambda_sent_cls', type=float, default=0.0, help='Weight for sentiment classification loss on shared (core improvement 2.5)')
 parser.add_argument('--lambda_sent_aux', type=float, default=0.0, help='Weight for sentiment center loss on shared (core improvement 2.5)')
 parser.add_argument('--use_crm', action='store_true', help='Use CRM (prototype classification) when use_ddm, scheme A: auxiliary loss only')
-parser.add_argument('--lambda_crm', type=float, default=0.1, help='Weight for CRM auxiliary loss')
+parser.add_argument('--lambda_crm', type=float, default=0.4, help='Weight for CRM auxiliary loss')
 parser.add_argument('--crm_num_prototypes', type=int, default=5, help='Number of prototypes per sentiment class in CRM')
 parser.add_argument('--use_sent_mod', action='store_true', help='Use modality-internal sentiment prototypes (SentMod) when use_ddm')
 parser.add_argument('--lambda_sent_mod', type=float, default=0.1, help='Weight for SentMod auxiliary loss')
@@ -77,6 +73,26 @@ parser.add_argument('--use_sent_mod_fuse', action='store_true', help='Fuse SentM
 parser.add_argument('--use_sent_mod_fuse_b', action='store_true', help='方案B: concat sentiment features to representation layer, then classifier0')
 parser.add_argument('--sent_mod_num_prototypes', type=int, default=5, help='Number of prototypes per sentiment class in SentMod')
 parser.add_argument('--sent_mod_fuse_text_weight', type=float, default=0.5, help='Weight for text branch when fusing SentMod logits (default 0.5, image/shared share the rest; >0.33 emphasizes text)')
+# 对比学习与课程学习参数（阶段2.6）
+parser.add_argument('--use_contrastive_loss', action='store_true', help='Use Supervised Contrastive Loss instead of Center Loss for sentiment supervision')
+parser.add_argument('--contrastive_temperature', type=float, default=0.07, help='Temperature parameter for contrastive loss (default: 0.07)')
+parser.add_argument('--use_curriculum', action='store_true', help='Use Curriculum Learning for CRF loss (train from easy to hard samples)')
+parser.add_argument('--curriculum_start_ratio', type=float, default=0.3, help='Starting sample ratio for curriculum learning (default: 0.3)')
+parser.add_argument('--curriculum_end_ratio', type=float, default=1.0, help='Ending sample ratio for curriculum learning (default: 1.0)')
+parser.add_argument('--curriculum_warmup_epochs', type=int, default=30, help='Number of warmup epochs for curriculum learning (default: 30)')
+# 类别不平衡处理参数（阶段2.7.1）
+parser.add_argument('--use_class_weights', action='store_true', help='Use class weights for CrossEntropyLoss to handle class imbalance')
+parser.add_argument('--class_weights', type=str, default=None, help='Comma-separated class weights (e.g., "1.0,0.8,3.5,0.9,1.0" for O,I,NEG,NEU,POS)')
+parser.add_argument('--use_focal_loss', action='store_true', help='Use Focal Loss instead of CrossEntropyLoss to handle class imbalance')
+parser.add_argument('--focal_loss_alpha', type=str, default=None, help='Alpha parameter for Focal Loss (float or comma-separated list)')
+parser.add_argument('--focal_loss_gamma', type=float, default=2.0, help='Gamma parameter for Focal Loss (default: 2.0)')
+# 对抗训练参数（阶段2.8）
+parser.add_argument('--use_fgm', action='store_true', help='Use FGM (Fast Gradient Method) adversarial training')
+parser.add_argument('--fgm_epsilon', type=float, default=1.0, help='Epsilon parameter for FGM adversarial training (default: 1.0)')
+# 熵增损失参数
+parser.add_argument('--use_entropy_increase', action='store_true', help='Use entropy increase loss to encourage diverse attention')
+parser.add_argument('--entropy_increase_weight', type=float, default=0.1, help='Weight for entropy increase loss (default: 0.1)')
+
 
 args = parser.parse_args()
 if args.use_sentiment_stream and args.use_ddm:
@@ -85,6 +101,26 @@ if args.use_sent_mod_fuse and args.use_sent_mod_fuse_b:
     raise ValueError("方案A和方案B不能同时启用，请选择其一")
 if args.use_sent_mod_fuse_b and not args.use_sent_mod:
     raise ValueError("方案B需要先启用 SentMod，请同时使用 --use_sent_mod")
+if args.use_class_weights and args.use_focal_loss:
+    raise ValueError("use_class_weights 与 use_focal_loss 互斥，请只启用其一")
+
+# 解析类别权重
+class_weights = None
+if args.class_weights is not None:
+    class_weights = [float(w) for w in args.class_weights.split(',')]
+    if len(class_weights) != 5:
+        raise ValueError(f"class_weights 必须包含5个值（O,I,NEG,NEU,POS），当前: {len(class_weights)}")
+
+# 解析 Focal Loss alpha
+focal_loss_alpha = None
+if args.focal_loss_alpha is not None:
+    if ',' in args.focal_loss_alpha:
+        focal_loss_alpha = [float(a) for a in args.focal_loss_alpha.split(',')]
+        if len(focal_loss_alpha) != 5:
+            raise ValueError(f"focal_loss_alpha 必须包含5个值或单个浮点数，当前: {len(focal_loss_alpha)}")
+    else:
+        focal_loss_alpha = float(args.focal_loss_alpha)
+
 dataset_type = args.dataset_type
 task_name = args.task_name
 alpha = args.alpha
@@ -259,11 +295,11 @@ vb_model = ICTModel(
     alpha=alpha,
     beta=beta,
     use_ddm=args.use_ddm,
+    use_asymmetric_dims=args.use_asymmetric_dims,
     ddm_mode=args.ddm_mode,
     use_image_token_align=args.use_image_token_align,
     ddm_debug=args.ddm_debug,
     lambda1=args.lambda1,
-    lambda2=args.lambda2,
     use_cfm=args.use_cfm,
     lambda3=args.lambda3,
     lambda4=args.lambda4,
@@ -280,6 +316,23 @@ vb_model = ICTModel(
     sent_mod_num_prototypes=args.sent_mod_num_prototypes,
     sent_mod_fuse_text_weight=args.sent_mod_fuse_text_weight,
     use_sentiment_stream=args.use_sentiment_stream,
+    # 对比学习与课程学习参数
+    use_contrastive_loss=args.use_contrastive_loss,
+    contrastive_temperature=args.contrastive_temperature,
+    use_curriculum=args.use_curriculum,
+    curriculum_start_ratio=args.curriculum_start_ratio,
+    curriculum_end_ratio=args.curriculum_end_ratio,
+    curriculum_warmup_epochs=args.curriculum_warmup_epochs,
+    total_epochs=epochs,
+    # 类别不平衡处理参数（阶段2.7.1）
+    use_class_weights=args.use_class_weights,
+    class_weights=class_weights,
+    use_focal_loss=args.use_focal_loss,
+    focal_loss_alpha=focal_loss_alpha,
+    focal_loss_gamma=args.focal_loss_gamma,
+    # 熵增损失参数
+    use_entropy_increase=args.use_entropy_increase,
+    entropy_increase_weight=args.entropy_increase_weight,
 )
 vb_model_dict = vb_model.state_dict()
 
@@ -326,16 +379,143 @@ training_args = TrainingArguments(
     per_device_eval_batch_size=batch_size,
     num_train_epochs=epochs,
     weight_decay=0.01,
+    max_grad_norm=5.0,  # 放宽梯度裁剪限制（1.0 -> 5.0）
+    # 学习率调度器配置
+    lr_scheduler_type="cosine",  # 使用余弦退火调度器
+    warmup_ratio=0.1,  # 前10%的步数用于warmup
     label_names=["labels","cross_labels"]
 )
 
 # 自定义 Trainer：模型返回 dict(logits, cross_logits)，prediction_step 返回 (logits, cross_logits) 供 compute_metrics 使用
 class ICTTrainer(Trainer):
+    def __init__(self, *args, use_fgm=False, fgm_epsilon=1.0, **kwargs):
+        """
+        初始化ICTTrainer
+
+        参数：
+            use_fgm: 是否使用FGM对抗训练
+            fgm_epsilon: FGM扰动强度
+        """
+        super().__init__(*args, **kwargs)
+        self.use_fgm = use_fgm
+        self.fgm = None
+        if self.use_fgm:
+            self.fgm = FGM(self.model, epsilon=fgm_epsilon)
+            print(f"FGM对抗训练已启用，epsilon={fgm_epsilon}")
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """
+        重写training_step以支持FGM对抗训练
+
+        训练流程：
+        1. 正常前向传播和反向传播
+        2. 如果启用FGM：
+           a. 在embedding层添加对抗扰动
+           b. 再次前向传播计算对抗损失
+           c. 反向传播累积对抗梯度
+           d. 恢复原始embedding
+        3. 更新参数
+
+        参数：
+            model: 训练模型
+            inputs: 输入数据
+            num_items_in_batch: batch中的样本数量（兼容新版transformers）
+        """
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+
+        # 正常的前向传播和反向传播
+        with self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs)
+
+        if self.args.n_gpu > 1:
+            loss = loss.mean()
+
+        if self.args.gradient_accumulation_steps > 1:
+            loss = loss / self.args.gradient_accumulation_steps
+
+        # 反向传播
+        if self.is_deepspeed_enabled:
+            self.accelerator.backward(loss)
+        else:
+            loss.backward()
+
+        # FGM对抗训练
+        if self.use_fgm and self.fgm is not None:
+            # 添加对抗扰动
+            self.fgm.attack()
+
+            # 对抗样本的前向传播
+            with self.compute_loss_context_manager():
+                loss_adv = self.compute_loss(model, inputs)
+
+            if self.args.n_gpu > 1:
+                loss_adv = loss_adv.mean()
+
+            if self.args.gradient_accumulation_steps > 1:
+                loss_adv = loss_adv / self.args.gradient_accumulation_steps
+
+            # 对抗样本的反向传播（累积梯度）
+            if self.is_deepspeed_enabled:
+                self.accelerator.backward(loss_adv)
+            else:
+                loss_adv.backward()
+
+            # 恢复embedding
+            self.fgm.restore()
+
+        return loss.detach()
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        """重写 evaluate 方法以收集和打印损失分量"""
+        # 初始化损失收集器
+        self._eval_loss_components = {}
+
+        # 调用父类的 evaluate 方法
+        metrics = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
+
+        # 打印损失分量详情
+        if self._eval_loss_components:
+            import numpy as np
+            print("\n" + "="*60)
+            print("验证集损失分量详情:")
+            print("="*60)
+
+            # 计算并打印每个损失分量的平均值
+            for key, values in sorted(self._eval_loss_components.items()):
+                if values:
+                    avg_value = np.mean(values)
+                    print(f"  {key:30s}: {avg_value:.6f}")
+
+            print("="*60 + "\n")
+
+        return metrics
+
+
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         inputs = self._prepare_inputs(inputs)
         with torch.no_grad():
             outputs = model(**inputs)
         loss = outputs.get("loss")
+
+        # 收集损失分量用于验证时分析
+        if not self.model.training and hasattr(self, '_eval_loss_components'):
+            # 累积各个损失分量
+            for key in outputs.keys():
+                # 收集所有包含 'loss' 的键
+                if 'loss' in key.lower():
+                    if key not in self._eval_loss_components:
+                        self._eval_loss_components[key] = []
+                    # 将 tensor 转换为 Python 数值（如果还是 tensor 的话）
+                    value = outputs[key]
+                    if torch.is_tensor(value):
+                        loss_value = value.item()
+                    elif isinstance(value, (int, float)):
+                        loss_value = value
+                    else:
+                        continue  # 跳过其他类型
+                    self._eval_loss_components[key].append(loss_value)
+
         if prediction_loss_only:
             return (loss, None, None)
         if isinstance(outputs, dict) and "logits" in outputs and "cross_logits" in outputs:
@@ -345,6 +525,14 @@ class ICTTrainer(Trainer):
         labels = inputs.get("labels")
         return (loss, logits, labels)
 
+# 课程学习回调：在每个 epoch 结束时更新模型状态
+class CurriculumCallback(TrainerCallback):
+    def on_epoch_end(self, args, state, control, model=None, **kwargs):
+        """在每个 epoch 结束时调用 model.on_epoch_end()"""
+        if model is not None and hasattr(model, 'on_epoch_end'):
+            model.on_epoch_end()
+
+
 trainer = ICTTrainer(
     model=vb_model,
     args=training_args,
@@ -353,6 +541,12 @@ trainer = ICTTrainer(
     compute_metrics=build_compute_metrics_fn(
         text_inputs=data_inputs["test"],
         pairs=test_pairs),
+    callbacks=[
+        CurriculumCallback(),  # 课程学习回调
+        # EarlyStoppingCallback(early_stopping_patience=3)  # Early Stopping: 已关闭，让模型训练完整个 epochs
+    ],
+    use_fgm=args.use_fgm,  # FGM对抗训练开关
+    fgm_epsilon=args.fgm_epsilon,  # FGM扰动强度
 )
 
 trainer.train()
@@ -377,10 +571,10 @@ with open(output_result_file, "a", encoding="utf-8") as f:
     model_para["random_seed"] = random_seed
     # DDM / 对抗解耦 相关
     model_para["use_ddm"] = args.use_ddm
+    model_para["use_asymmetric_dims"] = args.use_asymmetric_dims
     model_para["ddm_mode"] = args.ddm_mode
-    model_para["use_image_token_align"] = not args.no_image_token_align
+    model_para["use_image_token_align"] = args.use_image_token_align
     model_para["lambda1"] = args.lambda1
-    model_para["lambda2"] = args.lambda2
     model_para["ddm_debug"] = args.ddm_debug
     model_para["use_cfm"] = args.use_cfm
     model_para["lambda3"] = args.lambda3
@@ -398,8 +592,23 @@ with open(output_result_file, "a", encoding="utf-8") as f:
     model_para["sent_mod_fuse_text_weight"] = args.sent_mod_fuse_text_weight
     model_para["use_sentiment_stream"] = args.use_sentiment_stream
     model_para["use_multi_read_fused"] = args.use_ddm or args.use_sentiment_stream
+    # 对比学习与课程学习参数
+    model_para["use_contrastive_loss"] = args.use_contrastive_loss
+    model_para["contrastive_temperature"] = args.contrastive_temperature
+    model_para["use_curriculum"] = args.use_curriculum
+    model_para["curriculum_start_ratio"] = args.curriculum_start_ratio
+    model_para["curriculum_end_ratio"] = args.curriculum_end_ratio
+    model_para["curriculum_warmup_epochs"] = args.curriculum_warmup_epochs
+    # 对抗训练参数
+    model_para["use_fgm"] = args.use_fgm
+    model_para["fgm_epsilon"] = args.fgm_epsilon
 
+    # 添加时间戳和run_id，方便识别每次实验
+    f.write("=" * 80 + "\n")
+    f.write(f"实验时间: {run_id}\n")
+    f.write(f"Checkpoint: checkpoints/{dataset_type}/best_{run_id}/\n")
     f.write("参数: " + str(model_para) + "\n")
     f.write("multi: " + str(best_metric) + "\n")
     f.write("text: " + str(text_best_metric) + "\n")
+    f.write("=" * 80 + "\n")
     f.write("\n")

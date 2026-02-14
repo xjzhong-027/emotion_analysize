@@ -20,7 +20,12 @@ from sent_mod_module import SentModModule
 from sentiment_stream_module import SentimentStreamModule
 from mdre_components import (
     orthogonal_loss_for_sequence,
-    EnhancedTripletLossForSequence,
+)
+from entropy_utils import (
+    compute_entropy,
+    compute_attention_entropy,
+    compute_cross_attention_entropy,
+    compute_entropy_increase_loss,
 )
 
 class ICTModel(nn.Module):
@@ -34,13 +39,13 @@ class ICTModel(nn.Module):
         text_model_name: str = "roberta",
         image_model_name: str = "vit",
         use_ddm: bool = False,
+        use_asymmetric_dims: bool = False,
         ddm_mode: str = "text_shared",
         use_image_token_align: bool = True,
         ddm_debug: bool = False,
         ddm_log_path: str = "ddm_debug.log",
         ddm_feat_path: str = "ddm_features_sample.npy",
         lambda1: float = 1.5,
-        lambda2: float = 0.5,
         use_cfm: bool = False,
         lambda3: float = 0.3,
         lambda4: float = 0.1,
@@ -61,6 +66,21 @@ class ICTModel(nn.Module):
         use_legacy_plan_b: bool = False,
         use_legacy_multi: bool = False,
         use_sentiment_stream: bool = False,
+        use_contrastive_loss: bool = False,
+        contrastive_temperature: float = 0.07,
+        use_curriculum: bool = False,
+        curriculum_start_ratio: float = 0.3,
+        curriculum_end_ratio: float = 1.0,
+        curriculum_warmup_epochs: int = 30,
+        total_epochs: int = 60,
+        use_class_weights: bool = False,
+        class_weights: torch.Tensor = None,
+        use_focal_loss: bool = False,
+        focal_loss_alpha: torch.Tensor = None,
+        focal_loss_gamma: float = 2.0,
+        use_entropy_increase: bool = False,
+        entropy_increase_weight: float = 0.1,
+        entropy_increase_min_delta: float = 0.1,
     ):
         super().__init__()
         # 情感双流替代 DDM：二者互斥
@@ -168,10 +188,11 @@ class ICTModel(nn.Module):
 
         # 对抗损失权重（阶段2.3）
         self.lambda1 = lambda1  # 正交损失权重
-        self.lambda2 = lambda2  # 增强损失权重
+        # enhanced loss disabled; lambda2 removed
         
         # DDM模块与调试配置（阶段2.2）
         self.use_ddm = use_ddm
+        self.use_asymmetric_dims = use_asymmetric_dims
         self.use_image_token_align = use_image_token_align  # image_specific 按 token 对齐（消融可关）
         # ddm_mode 用于 Step 2.6 消融实验：
         # - "text_shared"：text_specific + shared_features
@@ -203,6 +224,22 @@ class ICTModel(nn.Module):
         self.lambda_crm = lambda_crm
         self.crm_num_prototypes = crm_num_prototypes
 
+        # 对比学习与课程学习参数（阶段2.6）
+        self.use_contrastive_loss = use_contrastive_loss
+        self.contrastive_temperature = contrastive_temperature
+        self.use_curriculum = use_curriculum
+        self.curriculum_start_ratio = curriculum_start_ratio
+        self.curriculum_end_ratio = curriculum_end_ratio
+        self.curriculum_warmup_epochs = curriculum_warmup_epochs
+        self.total_epochs = total_epochs
+
+        # 类别不平衡处理参数（阶段2.7.1）
+        self.use_class_weights = use_class_weights
+        self.class_weights = class_weights
+        self.use_focal_loss = use_focal_loss
+        self.focal_loss_alpha = focal_loss_alpha
+        self.focal_loss_gamma = focal_loss_gamma
+
         if self.use_ddm:
             # 使用文本编码器的hidden_size作为DDM的embed_dim
             # specific_dim 和 shared_dim 动态设置为 hidden_size 的一半，
@@ -215,36 +252,75 @@ class ICTModel(nn.Module):
                 specific_dim=specific_dim,
                 shared_dim=shared_dim,
                 use_image_token_align=use_image_token_align,
+                use_asymmetric_dims=use_asymmetric_dims,
             )
-            self.shared_dim = shared_dim  # 供情感监督头使用
+            # 根据是否使用非对称维度来设置 shared_dim（供情感监督头使用）
+            if use_asymmetric_dims:
+                self.shared_dim = 256  # 非对称模式下 shared_dim 固定为 256
+            else:
+                self.shared_dim = shared_dim  # 对称模式下使用计算的 shared_dim
             # 情感分类头（3 类：NEG/NEU/POS），仅对方面位置监督
             self.sentiment_cls_head = nn.Linear(shared_dim, 3)
             # 情感中心损失：3 个可学习中心
-            self.sentiment_centers = nn.Parameter(torch.zeros(3, shared_dim))
+            self.sentiment_centers = nn.Parameter(torch.zeros(3, self.shared_dim))
             nn.init.xavier_uniform_(self.sentiment_centers)
             if lambda_sent_cls > 0 or lambda_sent_aux > 0:
                 print(f"情感监督已启用: lambda_sent_cls={lambda_sent_cls}, lambda_sent_aux={lambda_sent_aux}")
-            print(f"DDM模块已启用: embed_dim={config1.hidden_size}, "
-                  f"specific_dim={specific_dim}, shared_dim={shared_dim}, "
-                  f"ddm_mode={self.ddm_mode}, use_image_token_align={self.use_image_token_align}, ddm_debug={self.ddm_debug}")
+
+            # 打印DDM配置信息
+            if use_asymmetric_dims:
+                print(f"DDM模块已启用（非对称维度）: embed_dim={config1.hidden_size}, "
+                      f"text_specific=512, image_specific=256, shared=256, "
+                      f"ddm_mode={self.ddm_mode}, use_image_token_align={self.use_image_token_align}, ddm_debug={self.ddm_debug}")
+            else:
+                print(f"DDM模块已启用（对称维度）: embed_dim={config1.hidden_size}, "
+                      f"specific_dim={specific_dim}, shared_dim={shared_dim}, "
+                      f"ddm_mode={self.ddm_mode}, use_image_token_align={self.use_image_token_align}, ddm_debug={self.ddm_debug}")
 
             # 当使用 "all" 模式时，需要一个线性层将 3 路拼接特征还原到 hidden_size
-            self.ddm_all_proj = nn.Linear(specific_dim * 3, config1.hidden_size)
+            if use_asymmetric_dims:
+                # 非对称模式：需要为不同的 ddm_mode 添加投影层
+                # text_shared: text_specific(512) + shared(256) = 768 -> 1024
+                self.ddm_text_shared_proj = nn.Linear(512 + 256, config1.hidden_size)
+                # image_shared: image_specific(256) + shared(256) = 512 -> 1024
+                self.ddm_image_shared_proj = nn.Linear(256 + 256, config1.hidden_size)
+                # all: text_specific(512) + image_specific(256) + shared(256) = 1024 -> 1024
+                self.ddm_all_proj = nn.Linear(512 + 256 + 256, config1.hidden_size)
+            else:
+                # 对称模式：specific_dim + shared_dim = hidden_size，不需要投影
+                self.ddm_text_shared_proj = None
+                self.ddm_image_shared_proj = None
+                # all 模式需要投影：specific_dim * 3 -> hidden_size
+                self.ddm_all_proj = nn.Linear(specific_dim * 3, config1.hidden_size)
 
             # 增强三元组损失（序列级，对全局池化后的特征进行约束）
-            self.enhanced_loss_fn = EnhancedTripletLossForSequence(hard_factor=0.0)
+            # enhanced loss disabled; no enhanced loss function
 
             # CFM 分类概率融合（阶段2.4）
             if self.use_cfm:
-                specific_dim = config1.hidden_size // 2
+                # CFM 的 input_dim 需要根据是否使用非对称维度来设置
+                if use_asymmetric_dims:
+                    # 非对称模式：需要将三路特征投影到统一维度
+                    cfm_input_dim = 256  # 统一投影到 256
+                    # 添加投影层：text_specific (512) -> 256
+                    self.cfm_text_proj = nn.Linear(512, 256)
+                    # image_specific_aligned 和 shared 已经是 256，不需要投影
+                    self.cfm_image_proj = None
+                    self.cfm_shared_proj = None
+                else:
+                    cfm_input_dim = config1.hidden_size // 2
+                    self.cfm_text_proj = None
+                    self.cfm_image_proj = None
+                    self.cfm_shared_proj = None
+
                 self.cfm = CFM(
-                    input_dim=specific_dim,
+                    input_dim=cfm_input_dim,
                     output_dim=config1.hidden_size,
                     num_features=3,
                     num_classes=text_num_labels,
                     seq_len=60,
                 )
-                print(f"CFM已启用: input_dim={specific_dim}, output_dim={config1.hidden_size}, lambda3={lambda3}, lambda4={lambda4}, cfm_debug={cfm_debug}")
+                print(f"CFM已启用: input_dim={cfm_input_dim}, output_dim={config1.hidden_size}, lambda3={lambda3}, lambda4={lambda4}, cfm_debug={cfm_debug}")
 
             # CRM 原型向量分类（仅当 use_crm 且 lambda_crm > 0 时实例化）
             if self.use_crm and self.lambda_crm > 0:
@@ -310,6 +386,13 @@ class ICTModel(nn.Module):
                     num_prototypes=sent_mod_num_prototypes,
                 )
                 print(f"SentMod已启用(情感双流路径): branch_dim={stream_dim}, lambda_sent_mod={lambda_sent_mod}")
+
+        # 熵增约束参数（阶段3.1）
+        self.use_entropy_increase = use_entropy_increase
+        self.entropy_increase_weight = entropy_increase_weight
+        self.entropy_increase_min_delta = entropy_increase_min_delta
+        if self.use_entropy_increase:
+            print(f"熵增约束已启用: weight={entropy_increase_weight}, min_delta={entropy_increase_min_delta}")
 
     def forward(self,
                 input_ids=None,
@@ -535,26 +618,50 @@ class ICTModel(nn.Module):
             cfm_fusion_weights = None
             cfm_branch_logits = None
             if self.use_cfm:
+                # 非对称模式：需要投影 text_specific 到统一维度
+                if self.use_asymmetric_dims:
+                    text_specific_cfm = self.cfm_text_proj(text_specific)  # [B, L, 512] -> [B, L, 256]
+                    image_specific_cfm = image_specific_aligned  # 已经是 256
+                    shared_features_cfm = shared_features  # 已经是 256
+                else:
+                    text_specific_cfm = text_specific
+                    image_specific_cfm = image_specific_aligned
+                    shared_features_cfm = shared_features
+
                 fused_features, cfm_fusion_weights, cfm_branch_logits = self.cfm(
-                    text_specific, image_specific_aligned, shared_features
+                    text_specific_cfm, image_specific_cfm, shared_features_cfm
                 )
                 text_fused = fused_features  # [B, L, hidden_size]
             else:
                 # 根据 ddm_mode 选择不同的融合策略（用于 Step 2.6 消融实验）；均使用 image_specific_aligned（token 级）
                 if self.ddm_mode == "text_shared":
-                    text_fused = torch.cat([text_specific, shared_features], dim=-1)  # [B, L_text, C]
+                    concat_feats = torch.cat([text_specific, shared_features], dim=-1)  # [B, L_text, 768 或 768]
+                    # 非对称模式需要投影到 hidden_size
+                    if self.use_asymmetric_dims:
+                        text_fused = self.ddm_text_shared_proj(concat_feats)  # [B, L_text, 1024]
+                    else:
+                        text_fused = concat_feats  # 对称模式：512+512=1024，不需要投影
 
                 elif self.ddm_mode == "image_shared":
-                    text_fused = torch.cat([image_specific_aligned, shared_features], dim=-1)  # [B, L_text, C]
+                    concat_feats = torch.cat([image_specific_aligned, shared_features], dim=-1)  # [B, L_text, 512 或 768]
+                    # 非对称模式需要投影到 hidden_size
+                    if self.use_asymmetric_dims:
+                        text_fused = self.ddm_image_shared_proj(concat_feats)  # [B, L_text, 1024]
+                    else:
+                        text_fused = concat_feats  # 对称模式：512+512=1024，不需要投影
 
                 elif self.ddm_mode == "all":
                     concat_feats = torch.cat(
                         [text_specific, image_specific_aligned, shared_features], dim=-1
-                    )  # [B, L_text, 3*C/2]
-                    text_fused = self.ddm_all_proj(concat_feats)  # [B, L_text, C]
+                    )  # [B, L_text, 1024 或 1152]
+                    text_fused = self.ddm_all_proj(concat_feats)  # [B, L_text, 1024]
 
                 else:
-                    text_fused = torch.cat([text_specific, shared_features], dim=-1)
+                    concat_feats = torch.cat([text_specific, shared_features], dim=-1)
+                    if self.use_asymmetric_dims:
+                        text_fused = self.ddm_text_shared_proj(concat_feats)
+                    else:
+                        text_fused = concat_feats
 
             # ========== DDM 调试日志与特征导出（可选） ==========
             if self.ddm_debug:
@@ -595,7 +702,7 @@ class ICTModel(nn.Module):
             text_token_logits = self.classifier1(sequence_output1)
             
             # 仍然需要计算cross_crf_loss和word_region_align_loss（使用原始特征，保持损失计算一致性）
-            image_text_cross_attention, mk, _ = self.image_text_cross(text_last_hidden_states, image_last_hidden_states)
+            image_text_cross_attention, mk, attn_weights_d = self.image_text_cross(text_last_hidden_states, image_last_hidden_states)
             # 模态内情感原型：三支分别前向得到 3 类 logits；方式 A 在 logits 上融合，方式 B 在表示层拼接
             text_sent_logits = None
             image_sent_logits = None
@@ -659,22 +766,27 @@ class ICTModel(nn.Module):
         # ===== 阶段2.3：对抗损失（正交损失 + 增强损失） =====
         if self.use_ddm:
             # 1) 正交损失使用「池化」的 image_specific（纯图像、无 text query），保持解耦几何意义
-            B_ddm, L_text_ddm, C_half_ddm = text_specific.size()
-            img_sp = image_specific.permute(0, 2, 1)  # [B, C/2, L_image]
-            img_sp_pooled = F.adaptive_avg_pool1d(img_sp, L_text_ddm)  # [B, C/2, L_text]
-            image_specific_pooled = img_sp_pooled.permute(0, 2, 1)  # [B, L_text, C/2]
+            # 只在 lambda1 > 0 且非对称模式关闭时计算（非对称模式下维度不同，无法计算正交损失）
+            if self.lambda1 > 0 and not self.use_asymmetric_dims:
+                B_ddm, L_text_ddm, C_half_ddm = text_specific.size()
+                img_sp = image_specific.permute(0, 2, 1)  # [B, C/2, L_image]
+                img_sp_pooled = F.adaptive_avg_pool1d(img_sp, L_text_ddm)  # [B, C/2, L_text]
+                image_specific_pooled = img_sp_pooled.permute(0, 2, 1)  # [B, L_text, C/2]
 
-            ortho_loss = orthogonal_loss_for_sequence(
-                text_specific,
-                image_specific_pooled,
-                shared_features,
-            )
+                ortho_loss = orthogonal_loss_for_sequence(
+                    text_specific,
+                    image_specific_pooled,
+                    shared_features,
+                )
+            else:
+                ortho_loss = torch.tensor(0.0, device=text_specific.device)
 
-            # 3) 增强损失：融合特征使用 token 级 image_specific_aligned（来自 DDM 第 4 个返回值，已在上面作用域）
-            fused_features = text_specific + image_specific_aligned + shared_features  # [B, L, C/2]
-            fused_global = fused_features.mean(dim=1)         # [B, C/2]
-            text_global = text_specific.mean(dim=1)           # [B, C/2]
-            shared_global = shared_features.mean(dim=1)       # [B, C/2]
+            # 3) 增强损失已禁用（enhanced loss disabled）
+            # 注意：非对称模式下三路特征维度不同，无法直接相加
+            # fused_features = text_specific + image_specific_aligned + shared_features
+            # fused_global = fused_features.mean(dim=1)
+            # text_global = text_specific.mean(dim=1)
+            # shared_global = shared_features.mean(dim=1)
 
             # 4) 从 token 级标签构造句子级标签（简单策略：取每句中最大标签值，O/I 为低优先级）
             with torch.no_grad():
@@ -682,23 +794,16 @@ class ICTModel(nn.Module):
                 # 0: O, 1: I, 2: B-NEG, 3: B-NEU, 4: B-POS
                 seq_labels = labels.max(dim=1).values  # [B]
 
-            enhanced_loss = self.enhanced_loss_fn(
-                fused_features=fused_global,
-                text_specific_features=text_global,
-                shared_features=shared_global,
-                labels=seq_labels,
-                normalize_feature=True,
-            )
-
             loss = (
                 cross_crf_loss
                 + self.beta * word_region_align_loss
                 + self.alpha * text_loss
                 + self.lambda1 * ortho_loss
-                + self.lambda2 * enhanced_loss
             )
 
             # CFM 辅助损失（阶段2.4）：分支一致性 + 权重正则
+            consistency_loss = 0.0
+            weight_reg_loss = 0.0
             if self.use_cfm and cfm_fusion_weights is not None and cfm_branch_logits is not None:
                 # 分支一致性：三路 branch_logits 与主路 text_token_logits 的 KL 散度（仅有效 token）
                 valid = (labels != -100).unsqueeze(-1).float()  # [B, L, 1]
@@ -733,8 +838,8 @@ class ICTModel(nn.Module):
                                     f"w_text_mean={w_mean[0]:.4f} w_image_mean={w_mean[1]:.4f} w_shared_mean={w_mean[2]:.4f} "
                                     f"w_text_std={w_std[0]:.4f} w_image_std={w_std[1]:.4f} w_shared_std={w_std[2]:.4f} "
                                     f"w_entropy={w_entropy:.4f} "
-                                    f"consistency_loss={consistency_loss.item():.4f} "
-                                    f"weight_reg_loss={weight_reg_loss.item():.4f} "
+                                    f"consistency_loss={consistency_loss.item() if isinstance(consistency_loss, torch.Tensor) else consistency_loss:.4f} "
+                                    f"weight_reg_loss={weight_reg_loss.item() if isinstance(weight_reg_loss, torch.Tensor) else weight_reg_loss:.4f} "
                                     f"lambda3={self.lambda3:.3f} lambda4={self.lambda4:.3f}\n"
                                 )
                         except Exception:
@@ -816,6 +921,31 @@ class ICTModel(nn.Module):
                     sent_mod_loss_val = sent_mod_loss.item()
                     loss = loss + self.lambda_sent_mod * sent_mod_loss
 
+            # 熵增约束损失（阶段3.1）
+            entropy_increase_loss_val = 0.0
+            if self.use_entropy_increase and self.entropy_increase_weight > 0 and attn_weights_d is not None:
+                # attn_weights_d 的形状应该是 [B, L_text, L_image]
+                # 计算每个文本token对图像区域的注意力分布的熵
+                # 熵 = -sum(p * log(p))，熵越大表示注意力越分散
+
+                # 添加小的epsilon避免log(0)
+                eps = 1e-10
+                attn_probs = attn_weights_d + eps
+
+                # 计算每个文本token的注意力熵
+                # attn_probs: [B, L_text, L_image]
+                entropy = -torch.sum(attn_probs * torch.log(attn_probs), dim=-1)  # [B, L_text]
+
+                # 只对方面词位置计算熵增损失
+                valid_aspect = (labels >= 2) & (labels <= 4)
+                if valid_aspect.any():
+                    aspect_entropy = entropy[valid_aspect]  # [N_aspect]
+                    # 熵增损失：鼓励方面词的注意力更加分散（熵更大）
+                    # 使用负熵作为损失，最小化负熵等价于最大化熵
+                    entropy_increase_loss = -torch.mean(aspect_entropy)
+                    entropy_increase_loss_val = entropy_increase_loss.item()
+                    loss = loss + self.entropy_increase_weight * entropy_increase_loss
+
             # 训练阶段：周期性记录各项损失到日志，便于诊断对抗损失占比
             if self.training:
                 if not hasattr(self, "adv_step"):
@@ -831,14 +961,12 @@ class ICTModel(nn.Module):
                                 f"text={text_loss.item():.4f} "
                                 f"align={word_region_align_loss.item():.4f} "
                                 f"ortho={ortho_loss.item():.4f} "
-                                f"enh={enhanced_loss.item():.4f} "
-                                f"lambda1={self.lambda1:.3f} "
-                                f"lambda2={self.lambda2:.3f}"
+                                f"lambda1={self.lambda1:.3f}"
                             )
                             # 如果启用了CFM，也记录CFM相关损失
                             if self.use_cfm and cfm_fusion_weights is not None and cfm_branch_logits is not None:
-                                consistency_loss_val = consistency_loss.item() if 'consistency_loss' in locals() else 0.0
-                                weight_reg_loss_val = weight_reg_loss.item() if 'weight_reg_loss' in locals() else 0.0
+                                consistency_loss_val = consistency_loss.item() if isinstance(consistency_loss, torch.Tensor) else consistency_loss
+                                weight_reg_loss_val = weight_reg_loss.item() if isinstance(weight_reg_loss, torch.Tensor) else weight_reg_loss
                                 log_line += (
                                     f" cfm_consistency={consistency_loss_val:.4f} "
                                     f"cfm_weight_reg={weight_reg_loss_val:.4f} "
@@ -858,6 +986,10 @@ class ICTModel(nn.Module):
                                 log_line += (
                                     f" sent_mod_loss={sent_mod_loss_val:.4f} lambda_sent_mod={self.lambda_sent_mod:.3f}"
                                 )
+                            if self.use_entropy_increase and self.entropy_increase_weight > 0:
+                                log_line += (
+                                    f" entropy_increase_loss={entropy_increase_loss_val:.4f} entropy_weight={self.entropy_increase_weight:.3f}"
+                                )
                             log_line += "\n"
                             f.write(log_line)
                     except Exception:
@@ -866,12 +998,46 @@ class ICTModel(nn.Module):
         else:
             # 原始损失（无对抗解耦）
             loss = cross_crf_loss + self.beta * word_region_align_loss + self.alpha * text_loss
-        
+
         # end train
-        return {"loss":loss,
-            "logits":text_token_logits,
+        # 返回详细的损失分量，便于验证时分析
+        loss_details = {
+            "loss": loss,
+            "logits": text_token_logits,
             "cross_logits": cross_logits,
-                }
+            # 主要损失分量
+            "cross_crf_loss": cross_crf_loss.item(),
+            "text_loss": text_loss.item(),
+            "word_region_align_loss": word_region_align_loss.item(),
+        }
+
+        # DDM 相关损失
+        if self.use_ddm:
+            loss_details["ortho_loss"] = ortho_loss.item()
+
+            # CFM 损失（只有当真正计算了CFM损失时才添加）
+            if self.use_cfm and isinstance(consistency_loss, torch.Tensor):
+                loss_details["cfm_consistency_loss"] = consistency_loss.item()
+                loss_details["cfm_weight_reg_loss"] = weight_reg_loss.item() if isinstance(weight_reg_loss, torch.Tensor) else weight_reg_loss
+
+            # 情感分类损失
+            if self.lambda_sent_cls > 0 or self.lambda_sent_aux > 0:
+                loss_details["sent_cls_loss"] = sent_cls_loss_val
+                loss_details["sent_aux_loss"] = sent_aux_loss_val
+
+            # CRM 损失
+            if self.use_crm and self.lambda_crm > 0:
+                loss_details["crm_loss"] = crm_loss_val
+
+            # SentMod 损失
+            if self.use_sent_mod and self.lambda_sent_mod > 0:
+                loss_details["sent_mod_loss"] = sent_mod_loss_val
+
+            # 熵增约束损失
+            if self.use_entropy_increase and self.entropy_increase_weight > 0:
+                loss_details["entropy_increase_loss"] = entropy_increase_loss_val
+
+        return loss_details
 
 def eye(x):
     b, m, n = x.size()
